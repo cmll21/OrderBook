@@ -117,12 +117,48 @@ public:
     Price get_price() const { return price_; }
     Quantity get_initial_quantity() const { return initial_quantity_; }
     Quantity get_remaining_quantity() const { return remaining_quantity_; }
+    Quantity get_filled_quantity() const { return initial_quantity_ - remaining_quantity_; }
     OrderStatus get_status() const { return status_; }
     auto get_timestamp() const { return timestamp_; }
 
-    void set_status(OrderStatus status) { status_ = status; }
+    void cancel()
+    {
+        if (status_ == OrderStatus::filled)
+            throw std::runtime_error("Cannot cancel a filled order");
+        status_ = OrderStatus::canceled;
+    }
+    void modify(Price new_price, Quantity new_quantity)
+    {
+        if (status_ == OrderStatus::filled)
+        {
+            throw std::runtime_error("Cannot modify a filled order");
+        }
+        else if (status_ == OrderStatus::canceled)
+        {
+            throw std::runtime_error("Cannot modify a canceled order");
+        }
+        if (new_quantity < get_filled_quantity())
+        {
+            throw std::runtime_error("Cannot reduce quantity below filled quantity");
+        }
+        price_ = new_price;
+        remaining_quantity_ += new_quantity - initial_quantity_;
+        initial_quantity_ = new_quantity;
 
-    void fill_order(Quantity quantity)
+        if (remaining_quantity_ == 0)
+        {
+            status_ = OrderStatus::filled;
+        }
+        else if (get_filled_quantity() > 0)
+        {
+            status_ = OrderStatus::partially_filled;
+        }
+        else
+        {
+            status_ = OrderStatus::open;
+        }
+    }
+    void fill(Quantity quantity)
     {
         if (quantity > remaining_quantity_)
             throw std::runtime_error("Cannot fill more than remaining quantity");
@@ -203,7 +239,7 @@ public:
         if (aggressive_order->get_type() == OrderType::immediate_or_cancel &&
             aggressive_order->get_remaining_quantity() > 0)
         {
-            aggressive_order->set_status(OrderStatus::canceled);
+            aggressive_order->cancel();
             logger_.log("ImmediateOrCancel order " +
                         std::to_string(aggressive_order->get_id()) +
                         " canceled due to remaining quantity");
@@ -266,8 +302,8 @@ private:
     {
         Quantity trade_quantity = std::min(aggressive_order->get_remaining_quantity(),
                                            resting_order->get_remaining_quantity());
-        aggressive_order->fill_order(trade_quantity);
-        resting_order->fill_order(trade_quantity);
+        aggressive_order->fill(trade_quantity);
+        resting_order->fill(trade_quantity);
 
         Price execution_price = resting_order->get_price();
         TradeInfo bid_trade, ask_trade;
@@ -330,18 +366,72 @@ public:
 
     void cancel_order(OrderID id)
     {
-        auto it = order_lookup_.find(id);
-        if (it == order_lookup_.end())
-            throw std::runtime_error("Order not found");
-
-        OrderPointer order = it->second;
+        OrderPointer order = find_order(id);
         if (order->get_status() == OrderStatus::filled)
             throw std::runtime_error("Cannot cancel a filled order");
 
         cancel_order_impl(order);
     }
 
+    // Remove an order without canceling it.
+    void remove_order(OrderID id)
+    {
+        OrderPointer order = find_order(id);
+        remove_order_impl(order);
+    }
+
+    void modify_order(OrderID id, Price new_price, Quantity new_total_quantity)
+    {
+        OrderPointer order = find_order(id);
+        if (order->get_status() == OrderStatus::filled || order->get_status() == OrderStatus::canceled)
+            throw std::runtime_error("Cannot modify a filled or canceled order");
+
+        // Remove order from its current container.
+        remove_order(id);
+
+        // Modify the order.
+        order->modify(new_price, new_total_quantity);
+
+        logger_.log("Modified order " + std::to_string(id) +
+                    " to new price " + std::to_string(new_price) +
+                    " and new total quantity " + std::to_string(new_total_quantity));
+
+        // If modification makes the order fully filled, remove from lookup and log.
+        if (order->get_status() == OrderStatus::filled)
+        {
+            order_lookup_.erase(id);
+            logger_.log("Order " + std::to_string(id) + " fully filled after modification.");
+            return;
+        }
+
+        // Attempt to re-match the modified order against the opposite book.
+        auto cancel_lambda = [this](OrderID order_id)
+        { this->cancel_order(order_id); };
+        MatchingEngine matching_engine(order_lookup_, trade_history_, cancel_lambda, logger_);
+
+        if (order->get_side() == OrderSide::buy)
+        {
+            matching_engine.match_order(order, asks_);
+            if (order->get_remaining_quantity() > 0)
+                bids_[order->get_price()].push_back(order);
+        }
+        else
+        {
+            matching_engine.match_order(order, bids_);
+            if (order->get_remaining_quantity() > 0)
+                asks_[order->get_price()].push_back(order);
+        }
+    }
+
 private:
+    OrderPointer find_order(OrderID id)
+    {
+        auto it = order_lookup_.find(id);
+        if (it == order_lookup_.end())
+            throw std::runtime_error("Order not found (find_order)");
+        return it->second;
+    }
+
     void cancel_order_impl(OrderPointer order)
     {
         Price price = order->get_price();
@@ -361,9 +451,31 @@ private:
             if (order_list.empty())
                 asks_.erase(price);
         }
-        order->set_status(OrderStatus::canceled);
+        order->cancel();
         order_lookup_.erase(order->get_id());
         logger_.log("Canceled order " + std::to_string(order->get_id()));
+    }
+
+    void remove_order_impl(OrderPointer order)
+    {
+        Price price = order->get_price();
+        if (order->get_side() == OrderSide::buy)
+        {
+            auto &order_list = bids_[price];
+            std::erase_if(order_list, [&](const OrderPointer &o)
+                          { return o == order; });
+            if (order_list.empty())
+                bids_.erase(price);
+        }
+        else
+        {
+            auto &order_list = asks_[price];
+            std::erase_if(order_list, [&](const OrderPointer &o)
+                          { return o == order; });
+            if (order_list.empty())
+                asks_.erase(price);
+        }
+        // logger_.log("Removed order " + std::to_string(order->get_id()));
     }
 
     std::map<Price, OrderPointers, std::greater<Price>> bids_;
@@ -390,13 +502,21 @@ int main()
 {
 
     ConsoleLogger console_logger;
-    OrderBook order_book(&console_logger);
 
-    order_book.add_order(1, OrderType::good_till_cancel, OrderSide::buy, 100, 10);
-    order_book.add_order(2, OrderType::good_till_cancel, OrderSide::sell, 90, 5);
-    order_book.add_order(3, OrderType::fill_or_kill, OrderSide::sell, 95, 10);
-    order_book.add_order(4, OrderType::immediate_or_cancel, OrderSide::buy, 105, 20);
-
-    print_trade_history(order_book.get_trade_history());
-    return 0;
+    OrderBook ob(&console_logger);
+    ob.add_order(6, OrderType::good_till_cancel, OrderSide::buy, 100, 10);
+    ob.add_order(7, OrderType::good_till_cancel, OrderSide::sell, 95, 6);
+    print_trade_history(ob.get_trade_history());
+    // Valid modification: new_total_quantity = 8 (>= filled amount 6)
+    ob.modify_order(6, 105, 8);
+    try
+    {
+        // Invalid modification: new_total_quantity = 5 (< filled amount 6)
+        ob.modify_order(6, 105, 5);
+    }
+    catch (const std::exception &e)
+    {
+        std::cout << "Exception: " << e.what() << "\n";
+    }
+    print_trade_history(ob.get_trade_history());
 }
