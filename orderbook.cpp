@@ -1,85 +1,84 @@
-#include <iostream>
-#include <vector>
-#include <deque>
-#include <map>
-#include <unordered_map>
-#include <cstdint>
-#include <memory>
-#include <format>
+/*
+TO DO:
+- Testing
+- Fix edge cases
+- Add order modification
 
+Eventually:
+- Add client/server communication
+- Add order book persistence
+- Add order book visualisation
+- Parallelise matching
+*/
+
+#include <algorithm>
+#include <chrono>
+#include <cstdint>
+#include <deque>
+#include <functional>
+#include <iostream>
+#include <map>
+#include <memory>
+#include <stdexcept>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+class Logger
+{
+public:
+    virtual ~Logger() = default;
+    virtual void log(const std::string &msg) = 0;
+};
+
+class ConsoleLogger : public Logger
+{
+public:
+    void log(const std::string &msg) override
+    {
+        std::cout << "[LOG] " << msg << std::endl;
+    }
+};
+
+class NullLogger : public Logger
+{
+public:
+    void log(const std::string &msg) override
+    {
+    }
+};
+
+static Logger &get_default_logger()
+{
+    static NullLogger default_logger;
+    return default_logger;
+}
+
+// Enums with snake_case values.
 enum class OrderType
 {
-    GoodTillCancel,
-    ImmediateOrCancel,
-    FillOrKill
+    good_till_cancel,
+    immediate_or_cancel,
+    fill_or_kill
 };
+
 enum class OrderSide
 {
-    Buy,
-    Sell
+    buy,
+    sell
 };
+
 enum class OrderStatus
 {
-    Open,
-    Filled,
-    Canceled
+    open,
+    partially_filled,
+    filled,
+    canceled
 };
 
 using Price = std::int32_t;
 using Quantity = std::uint32_t;
 using OrderID = std::uint64_t;
-
-struct LevelInfo
-{
-    Price price;
-    Quantity quantity;
-};
-
-using LevelInfos = std::vector<LevelInfo>;
-
-class Order
-{
-public:
-    Order(OrderID id, OrderType type, OrderSide side, Price price, Quantity initial_quantity)
-        : id_(id), type_(type), side_(side), price_(price), initial_quantity_(initial_quantity),
-          remaining_quantity_(initial_quantity), status_(OrderStatus::Open) {}
-
-    OrderID get_id() const { return id_; }
-    OrderType get_type() const { return type_; }
-    OrderSide get_side() const { return side_; }
-    Price get_price() const { return price_; }
-    Quantity get_initial_quantity() const { return initial_quantity_; }
-    Quantity get_remaining_quantity() const { return remaining_quantity_; }
-    Quantity get_filled_quantity() const { return initial_quantity_ - remaining_quantity_; }
-    OrderStatus get_status() const { return status_; }
-
-    void set_status(OrderStatus status) { status_ = status; }
-
-    void fill_order(Quantity quantity)
-    {
-        if (quantity > remaining_quantity_)
-        {
-            throw std::runtime_error("Cannot fill more than remaining quantity");
-        }
-        remaining_quantity_ -= quantity;
-        if (remaining_quantity_ == 0)
-        {
-            status_ = OrderStatus::Filled;
-        }
-    }
-
-private:
-    OrderID id_;
-    OrderType type_;
-    OrderSide side_;
-    Price price_;
-    Quantity initial_quantity_;
-    Quantity remaining_quantity_;
-    OrderStatus status_;
-};
-
-using OrderPointer = std::shared_ptr<Order>;
-using OrderPointers = std::deque<OrderPointer>;
 
 struct TradeInfo
 {
@@ -91,7 +90,8 @@ struct TradeInfo
 class Trade
 {
 public:
-    Trade(const TradeInfo &bid_trade, const TradeInfo &ask_trade) : bid_trade_(bid_trade), ask_trade_(ask_trade) {}
+    Trade(const TradeInfo &bid_trade, const TradeInfo &ask_trade)
+        : bid_trade_(bid_trade), ask_trade_(ask_trade) {}
 
     const TradeInfo &get_bid_trade() const { return bid_trade_; }
     const TradeInfo &get_ask_trade() const { return ask_trade_; }
@@ -103,25 +103,228 @@ private:
 
 using Trades = std::vector<Trade>;
 
+class Order
+{
+public:
+    Order(OrderID id, OrderType type, OrderSide side, Price price, Quantity initial_quantity)
+        : id_(id), type_(type), side_(side), price_(price),
+          initial_quantity_(initial_quantity), remaining_quantity_(initial_quantity),
+          timestamp_(std::chrono::steady_clock::now()), status_(OrderStatus::open) {}
+
+    OrderID get_id() const { return id_; }
+    OrderType get_type() const { return type_; }
+    OrderSide get_side() const { return side_; }
+    Price get_price() const { return price_; }
+    Quantity get_initial_quantity() const { return initial_quantity_; }
+    Quantity get_remaining_quantity() const { return remaining_quantity_; }
+    OrderStatus get_status() const { return status_; }
+    auto get_timestamp() const { return timestamp_; }
+
+    void set_status(OrderStatus status) { status_ = status; }
+
+    void fill_order(Quantity quantity)
+    {
+        if (quantity > remaining_quantity_)
+            throw std::runtime_error("Cannot fill more than remaining quantity");
+
+        Quantity old_remaining = remaining_quantity_;
+        OrderStatus old_status = status_;
+        try
+        {
+            remaining_quantity_ -= quantity;
+            status_ = (remaining_quantity_ == 0) ? OrderStatus::filled : OrderStatus::partially_filled;
+        }
+        catch (...)
+        {
+            remaining_quantity_ = old_remaining;
+            status_ = old_status;
+            throw;
+        }
+    }
+
+private:
+    OrderID id_;
+    OrderType type_;
+    OrderSide side_;
+    Price price_;
+    Quantity initial_quantity_;
+    Quantity remaining_quantity_;
+    std::chrono::steady_clock::time_point timestamp_;
+    OrderStatus status_;
+};
+
+using OrderPointer = std::shared_ptr<Order>;
+using OrderPointers = std::deque<OrderPointer>;
+
+// MatchingEngine handles the matching logic and logs key events.
+class MatchingEngine
+{
+public:
+    MatchingEngine(std::unordered_map<OrderID, OrderPointer> &order_lookup,
+                   Trades &trade_history,
+                   std::function<void(OrderID)> cancel_func,
+                   Logger &logger)
+        : order_lookup_(order_lookup), trade_history_(trade_history),
+          cancel_order_(cancel_func), logger_(logger) {}
+
+    template <typename OppositeMap>
+    void match_order(OrderPointer aggressive_order, OppositeMap &opposite_book)
+    {
+        if (aggressive_order->get_type() == OrderType::fill_or_kill &&
+            !has_sufficient_liquidity(aggressive_order, opposite_book))
+        {
+            logger_.log("Insufficient liquidity for fill_or_kill order " +
+                        std::to_string(aggressive_order->get_id()));
+            cancel_order_(aggressive_order->get_id());
+            return;
+        }
+
+        while (!opposite_book.empty() && aggressive_order->get_remaining_quantity() > 0)
+        {
+            auto best_it = opposite_book.begin();
+            Price best_price = best_it->first;
+            if (!is_price_acceptable(aggressive_order, best_price))
+            {
+                if (aggressive_order->get_type() == OrderType::immediate_or_cancel ||
+                    aggressive_order->get_type() == OrderType::fill_or_kill)
+                {
+                    logger_.log("Price not acceptable for order " +
+                                std::to_string(aggressive_order->get_id()));
+                    cancel_order_(aggressive_order->get_id());
+                }
+                break;
+            }
+            auto &order_list = best_it->second;
+            process_price_level(aggressive_order, order_list);
+            if (order_list.empty())
+                opposite_book.erase(best_it);
+        }
+
+        if (aggressive_order->get_type() == OrderType::immediate_or_cancel &&
+            aggressive_order->get_remaining_quantity() > 0)
+        {
+            aggressive_order->set_status(OrderStatus::canceled);
+            logger_.log("ImmediateOrCancel order " +
+                        std::to_string(aggressive_order->get_id()) +
+                        " canceled due to remaining quantity");
+            cancel_order_(aggressive_order->get_id());
+        }
+    }
+
+private:
+    template <typename OppositeMap>
+    bool has_sufficient_liquidity(OrderPointer aggressive_order, const OppositeMap &opposite_book) const
+    {
+        Quantity available = get_available_quantity(aggressive_order, opposite_book);
+        return available >= aggressive_order->get_remaining_quantity();
+    }
+
+    bool is_price_acceptable(OrderPointer aggressive_order, Price best_price) const
+    {
+        return (aggressive_order->get_side() == OrderSide::buy)
+                   ? (aggressive_order->get_price() >= best_price)
+                   : (aggressive_order->get_price() <= best_price);
+    }
+
+    void process_price_level(OrderPointer aggressive_order, OrderPointers &order_list)
+    {
+        while (!order_list.empty() && aggressive_order->get_remaining_quantity() > 0)
+        {
+            OrderPointer resting_order = order_list.front();
+            execute_trade(aggressive_order, resting_order);
+            if (resting_order->get_remaining_quantity() == 0)
+            {
+                order_list.pop_front();
+                order_lookup_.erase(resting_order->get_id());
+            }
+        }
+    }
+
+    template <typename OppositeMap>
+    Quantity get_available_quantity(OrderPointer aggressive_order, const OppositeMap &opposite_book) const
+    {
+        Quantity total = 0;
+        for (auto it = opposite_book.begin(); it != opposite_book.end(); ++it)
+        {
+            Price level_price = it->first;
+            bool level_matches = (aggressive_order->get_side() == OrderSide::buy)
+                                     ? (aggressive_order->get_price() >= level_price)
+                                     : (aggressive_order->get_price() <= level_price);
+            if (!level_matches)
+                break;
+            for (const auto &order : it->second)
+            {
+                total += order->get_remaining_quantity();
+                if (total >= aggressive_order->get_remaining_quantity())
+                    return total;
+            }
+        }
+        return total;
+    }
+
+    void execute_trade(OrderPointer aggressive_order, OrderPointer resting_order)
+    {
+        Quantity trade_quantity = std::min(aggressive_order->get_remaining_quantity(),
+                                           resting_order->get_remaining_quantity());
+        aggressive_order->fill_order(trade_quantity);
+        resting_order->fill_order(trade_quantity);
+
+        Price execution_price = resting_order->get_price();
+        TradeInfo bid_trade, ask_trade;
+        if (aggressive_order->get_side() == OrderSide::buy)
+        {
+            bid_trade = {aggressive_order->get_id(), execution_price, trade_quantity};
+            ask_trade = {resting_order->get_id(), execution_price, trade_quantity};
+        }
+        else
+        {
+            bid_trade = {resting_order->get_id(), execution_price, trade_quantity};
+            ask_trade = {aggressive_order->get_id(), execution_price, trade_quantity};
+        }
+        trade_history_.push_back(Trade(bid_trade, ask_trade));
+        logger_.log("Trade executed between orders " +
+                    std::to_string(aggressive_order->get_id()) + " and " +
+                    std::to_string(resting_order->get_id()));
+    }
+
+    std::unordered_map<OrderID, OrderPointer> &order_lookup_;
+    Trades &trade_history_;
+    std::function<void(OrderID)> cancel_order_;
+    Logger &logger_;
+};
+
+// OrderBook handles order placement and cancellation.
 class OrderBook
 {
 public:
-    OrderBook() {}
+    // In the constructor, if no logger is provided, we use a NullLogger.
+    OrderBook(Logger *logger = nullptr)
+        : logger_(logger ? *logger : get_default_logger()) {}
+
+    const Trades &get_trade_history() const { return trade_history_; }
 
     OrderPointer add_order(OrderID id, OrderType type, OrderSide side, Price price, Quantity quantity)
     {
         OrderPointer order = std::make_shared<Order>(id, type, side, price, quantity);
         order_lookup_[id] = order;
+        logger_.log("Added order " + std::to_string(id));
 
-        if (side == OrderSide::Buy)
+        auto cancel_lambda = [this](OrderID order_id)
+        { this->cancel_order(order_id); };
+        MatchingEngine matching_engine(order_lookup_, trade_history_, cancel_lambda, logger_);
+
+        if (side == OrderSide::buy)
         {
-            bids_[price].push_back(order);
+            matching_engine.match_order(order, asks_);
+            if (order->get_remaining_quantity() > 0)
+                bids_[price].push_back(order);
         }
         else
         {
-            asks_[price].push_back(order);
+            matching_engine.match_order(order, bids_);
+            if (order->get_remaining_quantity() > 0)
+                asks_[price].push_back(order);
         }
-
         return order;
     }
 
@@ -129,103 +332,71 @@ public:
     {
         auto it = order_lookup_.find(id);
         if (it == order_lookup_.end())
-        {
             throw std::runtime_error("Order not found");
-        }
 
         OrderPointer order = it->second;
-        if (order->get_status() == OrderStatus::Filled)
-        {
+        if (order->get_status() == OrderStatus::filled)
             throw std::runtime_error("Cannot cancel a filled order");
-        }
 
-        if (order->get_side() == OrderSide::Buy)
+        cancel_order_impl(order);
+    }
+
+private:
+    void cancel_order_impl(OrderPointer order)
+    {
+        Price price = order->get_price();
+        if (order->get_side() == OrderSide::buy)
         {
-            auto &orders = bids_[order->get_price()];
-            orders.erase(std::remove(orders.begin(), orders.end(), order), orders.end());
-            if (orders.empty())
-            {
-                bids_.erase(order->get_price());
-            }
+            auto &order_list = bids_[price];
+            std::erase_if(order_list, [&](const OrderPointer &o)
+                          { return o == order; });
+            if (order_list.empty())
+                bids_.erase(price);
         }
         else
         {
-            auto &orders = asks_[order->get_price()];
-            orders.erase(std::remove(orders.begin(), orders.end(), order), orders.end());
-            if (orders.empty())
-            {
-                asks_.erase(order->get_price());
-            }
+            auto &order_list = asks_[price];
+            std::erase_if(order_list, [&](const OrderPointer &o)
+                          { return o == order; });
+            if (order_list.empty())
+                asks_.erase(price);
         }
-
-        order->set_status(OrderStatus::Canceled);
-        order_lookup_.erase(it);
+        order->set_status(OrderStatus::canceled);
+        order_lookup_.erase(order->get_id());
+        logger_.log("Canceled order " + std::to_string(order->get_id()));
     }
 
-    void match()
-    {
-        while (!bids_.empty() && !asks_.empty())
-        {
-            auto best_bid = bids_.begin();
-            auto best_ask = asks_.begin();
-            if (best_bid->first < best_ask->first)
-            {
-                break;
-            }
-
-            auto &bid_orders = best_bid->second;
-            auto &ask_orders = best_ask->second;
-            auto bid_order = bid_orders.front();
-            auto ask_order = ask_orders.front();
-            auto trade_quantity = std::min(bid_order->get_remaining_quantity(), ask_order->get_remaining_quantity());
-
-            bid_order->fill_order(trade_quantity);
-            ask_order->fill_order(trade_quantity);
-
-            TradeInfo bid_trade{bid_order->get_id(), best_bid->first, trade_quantity};
-            TradeInfo ask_trade{ask_order->get_id(), best_ask->first, trade_quantity};
-            trade_history_.push_back(Trade{bid_trade, ask_trade});
-
-            if (bid_order->get_remaining_quantity() == 0)
-            {
-                bid_orders.pop_front();
-                if (bid_orders.empty())
-                {
-                    bids_.erase(best_bid);
-                }
-            }
-            if (ask_order->get_remaining_quantity() == 0)
-            {
-                ask_orders.pop_front();
-                if (ask_orders.empty())
-                {
-                    asks_.erase(best_ask);
-                }
-            }
-        }
-    }
-
-    size_t get_bid_count() const { return bids_.size(); }
-    size_t get_ask_count() const { return asks_.size(); }
-
-private:
     std::map<Price, OrderPointers, std::greater<Price>> bids_;
     std::map<Price, OrderPointers, std::less<Price>> asks_;
     std::unordered_map<OrderID, OrderPointer> order_lookup_;
     Trades trade_history_;
+    Logger &logger_;
 };
+
+void print_trade_history(const Trades &trades)
+{
+    for (const auto &trade : trades)
+    {
+        const auto &bid_trade = trade.get_bid_trade();
+        const auto &ask_trade = trade.get_ask_trade();
+        std::cout << "Trade: Bid Order " << bid_trade.order_id
+                  << " and Ask Order " << ask_trade.order_id
+                  << " at Price " << bid_trade.price
+                  << " for Quantity " << bid_trade.quantity << "\n";
+    }
+}
 
 int main()
 {
-    OrderBook order_book;
-    order_book.add_order(1, OrderType::GoodTillCancel, OrderSide::Buy, 100, 10);
-    order_book.add_order(2, OrderType::GoodTillCancel, OrderSide::Sell, 100, 10);
 
-    std::cout << std::format("OrderBook: bids={}, asks={}\n", order_book.get_bid_count(), order_book.get_ask_count());
+    ConsoleLogger console_logger;
+    OrderBook order_book(&console_logger);
 
-    order_book.match();
+    order_book.add_order(1, OrderType::good_till_cancel, OrderSide::buy, 100, 10);
+    order_book.add_order(2, OrderType::good_till_cancel, OrderSide::sell, 90, 5);
+    order_book.add_order(3, OrderType::fill_or_kill, OrderSide::sell, 95, 10);
+    order_book.add_order(4, OrderType::immediate_or_cancel, OrderSide::buy, 105, 20);
 
-    std::cout << std::format("OrderBook: bids={}, asks={}\n", order_book.get_bid_count(), order_book.get_ask_count());
-
+    print_trade_history(order_book.get_trade_history());
     return 0;
 }
