@@ -57,20 +57,46 @@ private:
 
         void process_request(const std::string &request)
         {
-            try
-            {
+            try {
                 auto parsed = json::parse(request);
-                OrderID id = std::stoull(std::string(parsed.at("id").as_string()));
-                OrderType type = (parsed.at("type").as_string() == "GTC") ? OrderType::good_till_cancel : OrderType::immediate_or_cancel;
-                OrderSide side = (parsed.at("side").as_string() == "buy") ? OrderSide::buy : OrderSide::sell;
-                Price price = static_cast<Price>(parsed.at("price").as_int64());
-                Quantity quantity = static_cast<Quantity>(parsed.at("quantity").as_int64());
+                auto obj = parsed.as_object();
+
+                // Check for the "summary" command
+                if (obj.contains("command") && obj["command"].as_string() == "summary") {
+                    json::object summary;
+                    json::array bids;
+                    for (const auto& level : order_book_.get_bids()) {
+                        json::object level_obj;
+                        level_obj["price"] = level.price;
+                        level_obj["quantity"] = level.quantity;
+                        bids.push_back(level_obj);
+                    }
+                    summary["bids"] = bids;
+
+                    json::array asks;
+                    for (const auto& level : order_book_.get_asks()) {
+                        json::object level_obj;
+                        level_obj["price"] = level.price;
+                        level_obj["quantity"] = level.quantity;
+                        asks.push_back(level_obj);
+                    }
+                    summary["asks"] = asks;
+
+                    send_response(json::serialize(summary));
+                    return;
+                }
+
+                // Process as a regular order message
+                OrderID id = std::stoull(std::string(obj.at("id").as_string()));
+                OrderType type = (obj.at("type").as_string() == "GTC") ? OrderType::good_till_cancel : OrderType::immediate_or_cancel;
+                OrderSide side = (obj.at("side").as_string() == "buy") ? OrderSide::buy : OrderSide::sell;
+                Price price = static_cast<Price>(obj.at("price").as_int64());
+                Quantity quantity = static_cast<Quantity>(obj.at("quantity").as_int64());
 
                 order_book_.add_order(id, type, side, price, quantity);
                 send_response("Order received: " + std::to_string(id));
             }
-            catch (const std::exception &e)
-            {
+            catch (const std::exception &e) {
                 send_response(std::string("Error processing order: ") + e.what());
             }
         }
