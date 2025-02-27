@@ -36,17 +36,18 @@ This project implements a real-time order book with a C++ backend (server, teste
 A sample `Makefile` is provided. To build all executables, run:
 
 ```bash
+cd backend
 make
 ```
 This will compile:
-- ```order_server``` – the C++ WebSocket server.
-- ```order_client``` – a C++ client.
-- ```tester_app``` – the trade simulator that connects to the server and performs simulated trades.
+- ```server``` – the C++ WebSocket server.
+- ```client``` – a C++ client.
+- ```tester``` – the trade simulator that connects to the server and performs simulated trades.
 
 ### React Client
 1. Navigate to directory:
 ```bash
-cd orderbook-app
+cd frontend
 ```
 2. Install dependencies:
 ```bash
