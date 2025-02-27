@@ -3,41 +3,16 @@ import React, { useState, useEffect } from 'react';
 import { Line } from 'react-chartjs-2';
 import 'chart.js/auto';
 
-// Component to display a time-series chart of best bid and ask prices.
-const OrderBookTimeSeriesChart = ({ summary }) => {
-    const [timeSeries, setTimeSeries] = useState([]);
-
-    useEffect(() => {
-        if (
-            summary &&
-            summary.bids &&
-            summary.asks &&
-            summary.bids.length > 0 &&
-            summary.asks.length > 0
-        ) {
-            const now = new Date().toLocaleTimeString();
-            // Assuming bids are sorted descending and asks ascending.
-            const bestBid = summary.bids[0].price;
-            const bestAsk = summary.asks[0].price;
-            setTimeSeries(prev => [...prev, { time: now, bestBid, bestAsk }]);
-        }
-    }, [summary]);
-
+// Time-series chart component for mid prices.
+const OrderBookTimeSeriesChart = ({ midPriceSeries }) => {
     const data = {
-        labels: timeSeries.map(pt => pt.time),
+        labels: midPriceSeries.map(pt => pt.time),
         datasets: [
             {
-                label: 'Best Bid Price',
-                data: timeSeries.map(pt => pt.bestBid),
-                borderColor: 'green',
-                backgroundColor: 'rgba(0, 200, 0, 0.2)',
-                fill: false,
-            },
-            {
-                label: 'Best Ask Price',
-                data: timeSeries.map(pt => pt.bestAsk),
-                borderColor: 'red',
-                backgroundColor: 'rgba(200, 0, 0, 0.2)',
+                label: 'Mid Price',
+                data: midPriceSeries.map(pt => pt.midPrice),
+                borderColor: 'blue',
+                backgroundColor: 'rgba(0, 0, 255, 0.2)',
                 fill: false,
             },
         ],
@@ -58,12 +33,10 @@ const OrderBookTimeSeriesChart = ({ summary }) => {
     );
 };
 
-// Component to render a depth chart for one side of the order book.
+// Depth chart component for one side of the order book.
 const OrderBookDepth = ({ levels, side }) => {
-    // Determine maximum volume for relative bar width.
     const maxVolume =
         levels && levels.length > 0 ? Math.max(...levels.map(level => level.quantity)) : 1;
-    // Use green for bids and red for asks.
     const barColor = side === 'bid' ? 'rgba(0, 200, 0, 0.3)' : 'rgba(200, 0, 0, 0.3)';
 
     return (
@@ -112,6 +85,66 @@ const OrderBookDepth = ({ levels, side }) => {
     );
 };
 
+// Metrics panel component that displays key calculated metrics.
+const MetricsPanel = ({ metrics }) => {
+    if (!metrics) return <div>No metrics available.</div>;
+    const { bestBid, bestAsk, spread, midPrice, totalBidVolume, totalAskVolume, volatility } = metrics;
+    return (
+        <div style={{ marginBottom: '1rem', border: '1px solid #ccc', padding: '1rem' }}>
+            <h3>Order Book Metrics</h3>
+            <p>
+                <strong>Best Bid:</strong> {bestBid}
+            </p>
+            <p>
+                <strong>Best Ask:</strong> {bestAsk}
+            </p>
+            <p>
+                <strong>Spread:</strong> {spread}
+            </p>
+            <p>
+                <strong>Mid Price:</strong> {midPrice}
+            </p>
+            <p>
+                <strong>Total Bid Volume:</strong> {totalBidVolume}
+            </p>
+            <p>
+                <strong>Total Ask Volume:</strong> {totalAskVolume}
+            </p>
+            <p>
+                <strong>Volatility (std. dev of mid price):</strong> {volatility.toFixed(2)}
+            </p>
+        </div>
+    );
+};
+
+// Helper function to calculate metrics from the current order book summary and mid price history.
+const calculateMetrics = (summary, midPrices) => {
+    if (
+        !summary ||
+        !summary.bids ||
+        !summary.asks ||
+        summary.bids.length === 0 ||
+        summary.asks.length === 0
+    ) {
+        return null;
+    }
+    const bestBid = summary.bids[0].price;
+    const bestAsk = summary.asks[0].price;
+    const spread = bestAsk - bestBid;
+    const midPrice = (bestAsk + bestBid) / 2;
+    const totalBidVolume = summary.bids.reduce((acc, level) => acc + level.quantity, 0);
+    const totalAskVolume = summary.asks.reduce((acc, level) => acc + level.quantity, 0);
+    let volatility = 0;
+    if (midPrices.length > 1) {
+        const mean = midPrices.reduce((acc, pt) => acc + pt.midPrice, 0) / midPrices.length;
+        const variance =
+            midPrices.reduce((acc, pt) => acc + Math.pow(pt.midPrice - mean, 2), 0) /
+            (midPrices.length - 1);
+        volatility = Math.sqrt(variance);
+    }
+    return { bestBid, bestAsk, spread, midPrice, totalBidVolume, totalAskVolume, volatility };
+};
+
 const OrderBookClient = () => {
     const [ws, setWs] = useState(null);
     const [connected, setConnected] = useState(false);
@@ -122,6 +155,7 @@ const OrderBookClient = () => {
     const [side, setSide] = useState('');
     const [price, setPrice] = useState('');
     const [quantity, setQuantity] = useState('');
+    const [midPriceSeries, setMidPriceSeries] = useState([]);
 
     // Establish WebSocket connection on mount.
     useEffect(() => {
@@ -133,9 +167,14 @@ const OrderBookClient = () => {
         socket.onmessage = event => {
             try {
                 const data = JSON.parse(event.data);
-                // If the message contains bids and asks, treat it as a summary update.
+                // If message contains bids and asks, update summary and record mid price.
                 if (data.bids && data.asks) {
                     setSummary(data);
+                    if (data.bids.length > 0 && data.asks.length > 0) {
+                        const midPrice = (data.bids[0].price + data.asks[0].price) / 2;
+                        const now = new Date().toLocaleTimeString();
+                        setMidPriceSeries(prev => [...prev, { time: now, midPrice }]);
+                    }
                 } else {
                     setMessages(prev => [...prev, data]);
                 }
@@ -154,12 +193,12 @@ const OrderBookClient = () => {
         };
     }, []);
 
-    // Automatically request order book summary every 100 ms.
+    // Automatically request summary every second.
     useEffect(() => {
         if (ws && connected) {
             const interval = setInterval(() => {
                 ws.send(JSON.stringify({ command: 'summary' }));
-            }, 100);
+            }, 1000);
             return () => clearInterval(interval);
         }
     }, [ws, connected]);
@@ -178,9 +217,14 @@ const OrderBookClient = () => {
         }
     };
 
+    const metrics = calculateMetrics(summary, midPriceSeries);
+
     return (
         <div style={{ padding: '1rem', fontFamily: 'sans-serif' }}>
             <h1>Order Book Client</h1>
+
+            {/* Display calculated metrics */}
+            <MetricsPanel metrics={metrics} />
 
             {/* Order submission form */}
             <div style={{ marginBottom: '1rem' }}>
@@ -237,11 +281,11 @@ const OrderBookClient = () => {
                 )}
             </div>
 
-            {/* Time-series chart */}
+            {/* Time-series chart for mid price */}
             <div style={{ marginTop: '1rem' }}>
-                <h3>Order Book Time-Series (Best Bid & Ask)</h3>
-                {summary ? (
-                    <OrderBookTimeSeriesChart summary={summary} />
+                <h3>Order Book Time-Series (Mid Price)</h3>
+                {midPriceSeries.length > 0 ? (
+                    <OrderBookTimeSeriesChart midPriceSeries={midPriceSeries} />
                 ) : (
                     <p>No time-series data available.</p>
                 )}
