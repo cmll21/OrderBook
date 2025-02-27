@@ -70,7 +70,7 @@ OrderBookProject/
 │   │   └── trade.hpp
 │   ├── src/              # Source files
 │   │   ├── client.cpp
-│   │   ├── logger.cpp      // if applicable
+│   │   ├── logger.cpp
 │   │   ├── matching_engine.cpp
 │   │   ├── order.cpp
 │   │   ├── order_book.cpp
