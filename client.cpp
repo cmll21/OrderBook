@@ -1,142 +1,166 @@
+#include <boost/beast/core.hpp>
+#include <boost/beast/websocket.hpp>
 #include <boost/asio.hpp>
 #include <boost/json.hpp>
 #include <iostream>
-#include <string>
+#include <sstream>
+#include <deque>
+#include <thread>
+#include <mutex>
 #include "order.hpp"
 
-using boost::asio::ip::tcp;
+namespace beast = boost::beast;
+namespace websocket = beast::websocket;
+namespace net = boost::asio;
 namespace json = boost::json;
+using tcp = net::ip::tcp;
 
-void send_order(tcp::socket &socket, OrderID id, const std::string &type, const std::string &side, int price, int quantity)
+class AsyncWebSocketClient : public std::enable_shared_from_this<AsyncWebSocketClient>
 {
-    json::object order_msg;
-    order_msg["id"] = std::to_string(id);
-    order_msg["type"] = type;
-    order_msg["side"] = side;
-    order_msg["price"] = price;
-    order_msg["quantity"] = quantity;
+    net::io_context& ioc_;
+    websocket::stream<tcp::socket> ws_;
+    beast::flat_buffer buffer_;
+    std::deque<std::string> write_msgs_;
+    std::mutex write_mutex_;
 
-    std::string message = json::serialize(order_msg) + "\n";
-    boost::asio::write(socket, boost::asio::buffer(message));
+public:
+    AsyncWebSocketClient(net::io_context &ioc)
+        : ioc_(ioc), ws_(ioc) {}
 
-    // Receive response
-    boost::asio::streambuf response_buffer;
-    boost::asio::read_until(socket, response_buffer, "\n");
-
-    std::istream response_stream(&response_buffer);
-    std::string response;
-    std::getline(response_stream, response);
-    std::cout << "Server response: " << response << std::endl;
-}
-
-void send_summary_request(tcp::socket &socket)
-{
-    json::object summary_cmd;
-    summary_cmd["command"] = "summary";
-    std::string message = json::serialize(summary_cmd) + "\n";
-    boost::asio::write(socket, boost::asio::buffer(message));
-
-    // Receive response containing the full order book
-    boost::asio::streambuf response_buffer;
-    boost::asio::read_until(socket, response_buffer, "\n");
-
-    std::istream response_stream(&response_buffer);
-    std::string response;
-    std::getline(response_stream, response);
-
-    // Parse the response
-    auto parsed = json::parse(response);
-    auto obj = parsed.as_object();
-
-    std::cout << "\nOrder Book Summary:\n";
-
-    if (obj.contains("bids")) {
-        auto bids = obj["bids"].as_array();
-        int total_bid_volume = 0;
-        std::cout << "\nBids:\n";
-        for (const auto& bid : bids) {
-            auto bid_obj = bid.as_object();
-            int price = bid_obj["price"].as_int64();
-            int quantity = bid_obj["quantity"].as_int64();
-            total_bid_volume += quantity;
-            std::cout << "Price: " << price << ", Quantity: " << quantity << "\n";
-        }
-        std::cout << "Total Bid Volume: " << total_bid_volume << "\n";
+    void run(const std::string &host, const std::string &port, const std::string &target = "/")
+    {
+        tcp::resolver resolver(ioc_);
+        auto const results = resolver.resolve(host, port);
+        net::async_connect(ws_.next_layer(), results,
+            [self = shared_from_this(), target](boost::system::error_code ec, auto /*endpoint*/) {
+                if (!ec)
+                {
+                    self->ws_.async_handshake("127.0.0.1", target,
+                        [self](boost::system::error_code ec) {
+                            if (!ec)
+                            {
+                                self->do_read();
+                            }
+                            else
+                            {
+                                std::cerr << "Handshake error: " << ec.message() << std::endl;
+                            }
+                        });
+                }
+                else
+                {
+                    std::cerr << "Connect error: " << ec.message() << std::endl;
+                }
+            });
     }
 
-    if (obj.contains("asks")) {
-        auto asks = obj["asks"].as_array();
-        int total_ask_volume = 0;
-        std::cout << "\nAsks:\n";
-        for (const auto& ask : asks) {
-            auto ask_obj = ask.as_object();
-            int price = ask_obj["price"].as_int64();
-            int quantity = ask_obj["quantity"].as_int64();
-            total_ask_volume += quantity;
-            std::cout << "Price: " << price << ", Quantity: " << quantity << "\n";
-        }
-        std::cout << "Total Ask Volume: " << total_ask_volume << "\n";
+    void send(const std::string &message)
+    {
+        net::post(ioc_,
+            [self = shared_from_this(), message]()
+            {
+                bool write_in_progress;
+                {
+                    std::lock_guard<std::mutex> lock(self->write_mutex_);
+                    write_in_progress = !self->write_msgs_.empty();
+                    self->write_msgs_.push_back(message);
+                }
+                if(!write_in_progress)
+                {
+                    self->do_write();
+                }
+            });
     }
-}
 
-void print_usage() {
-    std::cout << "\nAvailable commands:\n"
-              << "send <type> <side> <price> <quantity> - Send a new order\n"
-              << "summary - Request order book summary\n"
-              << "quit - Exit the program\n"
-              << "\nOrder types: GTC, IOC, FOK\n"
-              << "Order sides: buy, sell\n";
-}
+private:
+    void do_read()
+    {
+        ws_.async_read(buffer_,
+            [self = shared_from_this()](boost::system::error_code ec, std::size_t /*bytes_transferred*/)
+            {
+                if(!ec)
+                {
+                    std::string response = beast::buffers_to_string(self->buffer_.data());
+                    self->buffer_.consume(self->buffer_.size());
+                    std::cout << "Received: " << response << std::endl;
+                    self->do_read();
+                }
+                else
+                {
+                    std::cerr << "Read error: " << ec.message() << std::endl;
+                }
+            });
+    }
 
-bool get_order_input(std::string& command, std::string& type, std::string& side, int& price, int& quantity) {
-    std::cout << "\nEnter command: ";
-    std::cin >> command;
-    if (command == "quit") return false;
-    if (command == "send")
-        std::cin >> type >> side >> price >> quantity;
-    return true;
-}
+    void do_write()
+    {
+        std::lock_guard<std::mutex> lock(write_mutex_);
+        ws_.async_write(net::buffer(write_msgs_.front()),
+            [self = shared_from_this()](boost::system::error_code ec, std::size_t /*bytes_transferred*/)
+            {
+                if(!ec)
+                {
+                    std::lock_guard<std::mutex> lock(self->write_mutex_);
+                    self->write_msgs_.pop_front();
+                    if(!self->write_msgs_.empty())
+                    {
+                        self->do_write();
+                    }
+                }
+                else
+                {
+                    std::cerr << "Write error: " << ec.message() << std::endl;
+                }
+            });
+    }
+};
 
-int main() {
-    try {
-        boost::asio::io_context io_context;
-        tcp::resolver resolver(io_context);
-        tcp::resolver::results_type endpoints = resolver.resolve("127.0.0.1", "8080");
+int main()
+{
+    net::io_context ioc;
+    auto client = std::make_shared<AsyncWebSocketClient>(ioc);
+    client->run("127.0.0.1", "8080");
 
-        tcp::socket socket(io_context);
-        boost::asio::connect(socket, endpoints);
-        std::cout << "Connected to server" << std::endl;
+    // Run the io_context in a separate thread.
+    std::thread io_thread([&ioc]() { ioc.run(); });
 
-        print_usage();
-        OrderID order_id = 1;
-
-        while (true) {
+    std::cout << "Async WebSocket client. Enter commands:" << std::endl;
+    std::string line;
+    OrderID order_id = 1;
+    while(std::getline(std::cin, line))
+    {
+        if(line == "quit")
+            break;
+        else if(line == "summary")
+        {
+            json::object summary_cmd;
+            summary_cmd["command"] = "summary";
+            client->send(json::serialize(summary_cmd));
+        }
+        else if(line.find("send") == 0)
+        {
+            // Expected format: send <type> <side> <price> <quantity>
+            std::istringstream iss(line);
             std::string command, type, side;
-            int price = 0, quantity = 0;
-            if (!get_order_input(command, type, side, price, quantity))
-                break;
-            if (command == "send") {
-                try {
-                    send_order(socket, order_id++, type, side, price, quantity);
-                } catch (const std::exception& e) {
-                    std::cerr << "Error sending order: " << e.what() << std::endl;
-                }
-            } else if (command == "summary") {
-                try {
-                    send_summary_request(socket);
-                } catch (const std::exception& e) {
-                    std::cerr << "Error requesting summary: " << e.what() << std::endl;
-                }
-            } else {
-                std::cout << "Invalid command\n";
-                print_usage();
-            }
+            int price, quantity;
+            iss >> command >> type >> side >> price >> quantity;
+            json::object order_msg;
+            order_msg["id"] = std::to_string(order_id++);
+            order_msg["type"] = type;
+            order_msg["side"] = side;
+            order_msg["price"] = price;
+            order_msg["quantity"] = quantity;
+            client->send(json::serialize(order_msg));
         }
-
-        socket.close();
-    } catch (std::exception& e) {
-        std::cerr << "Client error: " << e.what() << std::endl;
-        return 1;
+        else
+        {
+            std::cout << "Unknown command. Use 'send <type> <side> <price> <quantity>', 'summary', or 'quit'." << std::endl;
+        }
     }
+
+    // Optionally, send a close message if needed.
+    client->send("{\"command\": \"quit\"}");
+    ioc.stop();
+    io_thread.join();
     return 0;
 }
