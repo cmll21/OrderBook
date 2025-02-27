@@ -1,5 +1,58 @@
 import React, { useState, useEffect } from 'react';
 
+// Component that renders the depth chart for one side of the order book.
+const OrderBookDepth = ({ levels, side }) => {
+    // Calculate maximum quantity to determine relative bar width.
+    const maxVolume = levels.length > 0 ? Math.max(...levels.map(level => level.quantity)) : 1;
+
+    // Choose bar color based on side: green for bids, red for asks.
+    const barColor = side === 'bid' ? 'rgba(0, 200, 0, 0.3)' : 'rgba(200, 0, 0, 0.3)';
+
+    return (
+        <div>
+            {levels.map((level, idx) => {
+                const widthPercent = (level.quantity / maxVolume) * 100;
+                return (
+                    <div
+                        key={idx}
+                        style={{
+                            position: 'relative',
+                            margin: '2px 0',
+                            height: '24px',
+                            lineHeight: '24px',
+                            fontSize: '14px',
+                            backgroundColor: '#f7f7f7'
+                        }}
+                    >
+                        <div
+                            style={{
+                                position: 'absolute',
+                                top: 0,
+                                bottom: 0,
+                                left: side === 'bid' ? 0 : 'auto',
+                                right: side === 'ask' ? 0 : 'auto',
+                                width: `${widthPercent}%`,
+                                backgroundColor: barColor,
+                            }}
+                        />
+                        <div
+                            style={{
+                                position: 'relative',
+                                paddingLeft: side === 'bid' ? '5px' : 0,
+                                paddingRight: side === 'ask' ? '5px' : 0,
+                                zIndex: 1,
+                                textAlign: side === 'bid' ? 'left' : 'right'
+                            }}
+                        >
+                            {`Price: ${level.price} | Qty: ${level.quantity}`}
+                        </div>
+                    </div>
+                );
+            })}
+        </div>
+    );
+};
+
 const OrderBookClient = () => {
     const [ws, setWs] = useState(null);
     const [connected, setConnected] = useState(false);
@@ -11,7 +64,7 @@ const OrderBookClient = () => {
     const [price, setPrice] = useState('');
     const [quantity, setQuantity] = useState('');
 
-    // Establish WebSocket connection on mount
+    // Establish WebSocket connection on mount.
     useEffect(() => {
         const socket = new WebSocket('ws://localhost:8080');
         socket.onopen = () => {
@@ -21,7 +74,7 @@ const OrderBookClient = () => {
         socket.onmessage = (event) => {
             try {
                 const data = JSON.parse(event.data);
-                // If message contains bids and asks, treat as a summary update.
+                // If message contains bids and asks, treat it as an order book summary update.
                 if (data.bids && data.asks) {
                     setSummary(data);
                 } else {
@@ -38,24 +91,21 @@ const OrderBookClient = () => {
         };
 
         setWs(socket);
-
-        // Clean up on unmount
         return () => {
             socket.close();
         };
     }, []);
 
-    // Automatically request a summary every 1 second
+    // Automatically request summary every 100 ms.
     useEffect(() => {
         if (ws && connected) {
             const interval = setInterval(() => {
                 sendSummary();
-            }, 1000); // Update every 1000ms (1 second)
+            }, 100);
             return () => clearInterval(interval);
         }
     }, [ws, connected]);
 
-    // Send order over WebSocket
     const sendOrder = () => {
         if (ws && connected) {
             const order = {
@@ -70,7 +120,6 @@ const OrderBookClient = () => {
         }
     };
 
-    // Request order book summary from the server
     const sendSummary = () => {
         if (ws && connected) {
             const summaryCmd = { command: "summary" };
@@ -78,27 +127,11 @@ const OrderBookClient = () => {
         }
     };
 
-    // Compute total volumes from summary data
-    const computeTotals = () => {
-        let totalBids = 0, totalAsks = 0;
-        if (summary) {
-            summary.bids.forEach(level => {
-                totalBids += level.quantity;
-            });
-            summary.asks.forEach(level => {
-                totalAsks += level.quantity;
-            });
-        }
-        return { totalBids, totalAsks };
-    };
-
-    const { totalBids, totalAsks } = computeTotals();
-
     return (
-        <div style={{ padding: '1rem' }}>
+        <div style={{ padding: '1rem', fontFamily: 'sans-serif' }}>
             <h1>Order Book Client</h1>
 
-            {/* Order Form */}
+            {/* Order submission form */}
             <div style={{ marginBottom: '1rem' }}>
                 <h3>Send Order</h3>
                 <input
@@ -120,67 +153,41 @@ const OrderBookClient = () => {
                     placeholder="Price"
                     value={price}
                     onChange={e => setPrice(e.target.value)}
-                    style={{ marginRight: '0.5rem' }}
+                    style={{ marginRight: '0.5rem', width: '80px' }}
                 />
                 <input
                     type="number"
                     placeholder="Quantity"
                     value={quantity}
                     onChange={e => setQuantity(e.target.value)}
-                    style={{ marginRight: '0.5rem' }}
+                    style={{ marginRight: '0.5rem', width: '80px' }}
                 />
                 <button onClick={sendOrder} disabled={!connected}>
                     Send Order
                 </button>
             </div>
 
-            {/* Summary GUI */}
-            {summary && (
-                <div style={{ marginBottom: '1rem' }}>
-                    <h3>Order Book Summary</h3>
-                    <div style={{ marginBottom: '1rem' }}>
-                        <h4>Bids (Total Volume: {totalBids})</h4>
-                        <table border="1" cellPadding="5">
-                            <thead>
-                            <tr>
-                                <th>Price</th>
-                                <th>Quantity</th>
-                            </tr>
-                            </thead>
-                            <tbody>
-                            {summary.bids.map((level, idx) => (
-                                <tr key={idx}>
-                                    <td>{level.price}</td>
-                                    <td>{level.quantity}</td>
-                                </tr>
-                            ))}
-                            </tbody>
-                        </table>
+            {/* Graphical order book summary */}
+            <div style={{ marginBottom: '1rem' }}>
+                <h3>Order Book Summary (Live Update)</h3>
+                {summary ? (
+                    <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+                        <div style={{ flex: 1, marginRight: '1rem' }}>
+                            <h4>Bids</h4>
+                            <OrderBookDepth levels={summary.bids} side="bid" />
+                        </div>
+                        <div style={{ flex: 1, marginLeft: '1rem' }}>
+                            <h4>Asks</h4>
+                            <OrderBookDepth levels={summary.asks} side="ask" />
+                        </div>
                     </div>
-                    <div>
-                        <h4>Asks (Total Volume: {totalAsks})</h4>
-                        <table border="1" cellPadding="5">
-                            <thead>
-                            <tr>
-                                <th>Price</th>
-                                <th>Quantity</th>
-                            </tr>
-                            </thead>
-                            <tbody>
-                            {summary.asks.map((level, idx) => (
-                                <tr key={idx}>
-                                    <td>{level.price}</td>
-                                    <td>{level.quantity}</td>
-                                </tr>
-                            ))}
-                            </tbody>
-                        </table>
-                    </div>
-                </div>
-            )}
+                ) : (
+                    <p>No summary available.</p>
+                )}
+            </div>
 
-            {/* General Messages */}
-            <div>
+            {/* Message log */}
+            <div style={{ marginTop: '1rem' }}>
                 <h3>Messages</h3>
                 <ul style={{ listStyle: 'none', padding: 0 }}>
                     {messages.map((msg, idx) => (
