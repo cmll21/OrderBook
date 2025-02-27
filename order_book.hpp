@@ -7,13 +7,23 @@
 #include "logger.hpp"
 #include <map>
 #include <unordered_map>
-#include <memory>
+
+struct OrderLevel {
+    Price price;
+    Quantity quantity;
+};
+
+using OrderLevels = std::vector<OrderLevel>;
 
 class OrderBook
 {
 public:
     OrderBook(Logger *logger = nullptr);
     const Trades &get_trade_history() const;
+
+    OrderLevels get_bids() const;
+    OrderLevels get_asks() const;
+
     OrderPointer add_order(OrderID id, OrderType type, OrderSide side, Price price, Quantity quantity);
     void cancel_order(OrderID id);
     void modify_order(OrderID id, Price new_price, Quantity new_total_quantity);

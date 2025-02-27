@@ -4,6 +4,34 @@ OrderBook::OrderBook(Logger *logger) : logger_(logger ? *logger : get_default_lo
 
 const Trades &OrderBook::get_trade_history() const { return trade_history_; }
 
+OrderLevels OrderBook::get_bids() const {
+    OrderLevels levels;
+    for (const auto& [price, orders] : bids_) {
+        if (!orders.empty()) {
+            Quantity total = 0;
+            for (const auto& order : orders) {
+                total += order->get_remaining_quantity();
+            }
+            levels.push_back({price, total});
+        }
+    }
+    return levels;
+}
+
+OrderLevels OrderBook::get_asks() const {
+    OrderLevels levels;
+    for (const auto& [price, orders] : asks_) {
+        if (!orders.empty()) {
+            Quantity total = 0;
+            for (const auto& order : orders) {
+                total += order->get_remaining_quantity();
+            }
+            levels.push_back({price, total});
+        }
+    }
+    return levels;
+}
+
 OrderPointer OrderBook::add_order(OrderID id, OrderType type, OrderSide side, Price price, Quantity quantity)
 {
     OrderPointer order = std::make_shared<Order>(id, type, side, price, quantity);

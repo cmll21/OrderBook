@@ -1,8 +1,6 @@
 #include <boost/asio.hpp>
 #include <boost/json.hpp>
 #include <iostream>
-#include <unordered_map>
-#include <memory>
 #include "order_book.hpp"
 
 using boost::asio::ip::tcp;
