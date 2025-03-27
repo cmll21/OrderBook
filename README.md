@@ -22,18 +22,18 @@ This project implements a real-time order book with a C++ backend (server, teste
 
 - C++20 compatible compiler (g++/clang++)
 - [Boost Libraries](https://www.boost.org) (Asio, Beast, JSON)
-- Make (or CMake) for building
+- Make (or CMake)
 
 ### React Frontend
 
 - [Node.js](https://nodejs.org/) and npm (or yarn)
-- Create React App (or your preferred React setup)
+- Create React App
 
 ## Build and Run
 
 ### C++ Server and Tester
 
-A sample `Makefile` is provided. To build all executables, run:
+A `Makefile` is provided. To build all executables, run:
 
 ```bash
 cd backend
